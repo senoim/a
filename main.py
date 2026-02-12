@@ -1,391 +1,335 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-بوت تلجرام احترافي لتفعيل أرقام واتساب خليجية
-يستخدم API من موقع SMS-Activate.org
-"""
-
 import os
 import logging
-from typing import Dict
 import requests
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import json
+import asyncio
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
-    CommandHandler,
     CallbackQueryHandler,
+    CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
-# إعداد نظام السجلات
+# إعداد السجلات (Logging)
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# جلب المتغيرات البيئية
-BOT_TOKEN = os.getenv('BOT_TOKEN')
-SMS_API_KEY = os.getenv('SMS_API_KEY')
+# جلب متغيرات البيئة
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+SMS_API_KEY = os.getenv("SMS_API_KEY")
+API_BASE_URL = "https://api.sms-man.com/stubs/handler_api.php"
 
-# التحقق من وجود المتغيرات
-if not BOT_TOKEN or not SMS_API_KEY:
-    raise ValueError("❌ يجب تعيين BOT_TOKEN و SMS_API_KEY في متغيرات البيئة")
-
-# إعدادات API
-SMS_ACTIVATE_BASE_URL = "https://api.sms-activate.org/stubs/handler_api.php"
-SERVICE_CODE = "wa"  # كود خدمة الواتساب
-
-# معلومات الدول الخليجية
-GULF_COUNTRIES = {
-    'saudi': {'name': 'السعودية 🇸🇦', 'id': 2},
-    'uae': {'name': 'الإمارات 🇦🇪', 'id': 95},
-    'kuwait': {'name': 'الكويت 🇰🇼', 'id': 48},
-    'qatar': {'name': 'قطر 🇶🇦', 'id': 110},
+# تخزين مؤقت للبيانات لتقليل طلبات API
+cache = {
+    "countries": [],
+    "services": [],
+    "last_update": 0
 }
 
-# تخزين مؤقت لبيانات المستخدمين (في بيئة الإنتاج استخدم قاعدة بيانات)
-user_data: Dict[int, dict] = {}
+async def get_balance():
+    params = {"action": "getBalance", "api_key": SMS_API_KEY}
+    try:
+        response = requests.get(API_BASE_URL, params=params)
+        if "ACCESS_BALANCE" in response.text:
+            return response.text.split(":")[1]
+        return "0"
+    except Exception as e:
+        logger.error(f"Error getting balance: {e}")
+        return "Error"
 
+async def get_countries():
+    if cache["countries"]:
+        return cache["countries"]
+    params = {"action": "getCountries", "api_key": SMS_API_KEY}
+    try:
+        response = requests.get(API_BASE_URL, params=params)
+        data = response.json()
+        # تحويل القاموس إلى قائمة إذا لزم الأمر
+        countries = []
+        if isinstance(data, dict):
+            for cid, cinfo in data.items():
+                countries.append({"id": cid, "name": cinfo.get("name_en", cinfo.get("name", "Unknown"))})
+        elif isinstance(data, list):
+            countries = data
+        cache["countries"] = countries
+        return countries
+    except Exception as e:
+        logger.error(f"Error getting countries: {e}")
+        return []
 
-class SMSActivateAPI:
-    """كلاس للتعامل مع API موقع SMS-Activate"""
-    
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        self.base_url = SMS_ACTIVATE_BASE_URL
-    
-    def _make_request(self, params: dict) -> str:
-        """إجراء طلب API مع معالجة الأخطاء"""
-        try:
-            params['api_key'] = self.api_key
-            response = requests.get(self.base_url, params=params, timeout=10)
-            response.raise_for_status()
-            return response.text
-        except requests.exceptions.RequestException as e:
-            logger.error(f"خطأ في الاتصال بـ API: {e}")
-            return f"ERROR:CONNECTION_FAILED"
-    
-    def get_balance(self) -> float:
-        """الحصول على الرصيد الحالي"""
-        result = self._make_request({'action': 'getBalance'})
-        if result.startswith('ACCESS_BALANCE:'):
-            return float(result.split(':')[1])
-        return 0.0
-    
-    def get_number(self, country_id: int, service: str = SERVICE_CODE) -> dict:
-        """حجز رقم جديد"""
-        params = {
-            'action': 'getNumber',
-            'service': service,
-            'country': country_id,
-        }
-        result = self._make_request(params)
-        
-        if result.startswith('ACCESS_NUMBER:'):
-            parts = result.split(':')
-            return {
-                'success': True,
-                'activation_id': parts[1],
-                'phone_number': parts[2]
-            }
-        elif result == 'NO_NUMBERS':
-            return {'success': False, 'error': 'لا توجد أرقام متاحة حالياً'}
-        elif result == 'NO_BALANCE':
-            return {'success': False, 'error': 'رصيد غير كافٍ'}
-        elif result.startswith('BAD_'):
-            return {'success': False, 'error': f'خطأ في الطلب: {result}'}
-        else:
-            return {'success': False, 'error': f'خطأ غير متوقع: {result}'}
-    
-    def get_status(self, activation_id: str) -> dict:
-        """الحصول على حالة الرقم والكود"""
-        params = {
-            'action': 'getStatus',
-            'id': activation_id,
-        }
-        result = self._make_request(params)
-        
-        if result.startswith('STATUS_OK:'):
-            code = result.split(':')[1]
-            return {'success': True, 'status': 'received', 'code': code}
-        elif result == 'STATUS_WAIT_CODE':
-            return {'success': True, 'status': 'waiting'}
-        elif result == 'STATUS_CANCEL':
-            return {'success': True, 'status': 'cancelled'}
-        else:
-            return {'success': False, 'error': result}
-    
-    def set_status(self, activation_id: str, status: int) -> bool:
-        """تغيير حالة التفعيل (1=تم الاستلام، 8=إلغاء)"""
-        params = {
-            'action': 'setStatus',
-            'id': activation_id,
-            'status': status,
-        }
-        result = self._make_request(params)
-        return result == 'ACCESS_ACTIVATION' or result == 'ACCESS_CANCEL'
+async def get_services():
+    if cache["services"]:
+        return cache["services"]
+    params = {"action": "getServices", "api_key": SMS_API_KEY}
+    try:
+        response = requests.get(API_BASE_URL, params=params)
+        data = response.json()
+        services = []
+        if isinstance(data, dict):
+            for sid, sinfo in data.items():
+                services.append({"id": sid, "name": sinfo.get("name", "Unknown")})
+        elif isinstance(data, list):
+            services = data
+        cache["services"] = services
+        return services
+    except Exception as e:
+        logger.error(f"Error getting services: {e}")
+        return []
 
-
-# إنشاء كائن API
-sms_api = SMSActivateAPI(SMS_API_KEY)
-
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """معالج أمر /start - عرض قائمة الدول"""
-    user = update.effective_user
-    logger.info(f"المستخدم {user.id} ({user.username}) بدأ البوت")
-    
-    # إنشاء أزرار الدول
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    balance = await get_balance()
+    user_name = update.effective_user.first_name
+    welcome_text = (
+        f"مرحباً بك يا {user_name} في بوت تفعيل الأرقام الاحترافي 🤖\n\n"
+        f"💰 رصيدك الحالي: {balance} USD\n\n"
+        "يمكنك البدء باختيار الدولة ثم الخدمة المطلوبة."
+    )
     keyboard = [
-        [
-            InlineKeyboardButton(GULF_COUNTRIES['saudi']['name'], callback_data='country_saudi'),
-            InlineKeyboardButton(GULF_COUNTRIES['uae']['name'], callback_data='country_uae'),
-        ],
-        [
-            InlineKeyboardButton(GULF_COUNTRIES['kuwait']['name'], callback_data='country_kuwait'),
-            InlineKeyboardButton(GULF_COUNTRIES['qatar']['name'], callback_data='country_qatar'),
-        ],
-        [
-            InlineKeyboardButton("💰 عرض الرصيد", callback_data='check_balance'),
-        ]
+        [InlineKeyboardButton("🌍 اختيار الدولة", callback_query_data="list_countries")],
+        [InlineKeyboardButton("💰 تحديث الرصيد", callback_query_data="update_balance")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    welcome_text = (
-        f"مرحباً {user.first_name}! 👋\n\n"
-        "🔢 بوت تفعيل أرقام واتساب خليجية\n\n"
-        "اختر الدولة التي تريد الحصول على رقم منها:"
-    )
-    
-    await update.message.reply_text(welcome_text, reply_markup=reply_markup)
+    if update.message:
+        await update.message.reply_text(welcome_text, reply_markup=reply_markup)
+    else:
+        await update.callback_query.edit_message_text(welcome_text, reply_markup=reply_markup)
 
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """معالج نقرات الأزرار"""
+async def list_countries(update: Update, context: ContextTypes.DEFAULT_TYPE, page=0):
     query = update.callback_query
-    await query.answer()
+    countries = await get_countries()
     
-    user_id = update.effective_user.id
-    data = query.data
+    # تقسيم الدول لصفحات (10 في كل صفحة)
+    per_page = 10
+    start_idx = page * per_page
+    end_idx = start_idx + per_page
+    current_countries = countries[start_idx:end_idx]
     
-    # التعامل مع اختيار الدولة
-    if data.startswith('country_'):
-        country_key = data.replace('country_', '')
-        await handle_country_selection(query, user_id, country_key)
+    keyboard = []
+    for country in current_countries:
+        c_name = country.get("name_en", country.get("name", "Unknown"))
+        c_id = country.get("id")
+        keyboard.append([InlineKeyboardButton(f"🏳️ {c_name}", callback_query_data=f"select_country:{c_id}")])
     
-    # التعامل مع تحديث الكود
-    elif data.startswith('refresh_'):
-        activation_id = data.replace('refresh_', '')
-        await handle_refresh_code(query, user_id, activation_id)
+    # أزرار التنقل
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(InlineKeyboardButton("⬅️ السابق", callback_query_data=f"page_country:{page-1}"))
+    if end_idx < len(countries):
+        nav_buttons.append(InlineKeyboardButton("التالي ➡️", callback_query_data=f"page_country:{page+1}"))
     
-    # التعامل مع إلغاء الرقم
-    elif data.startswith('cancel_'):
-        activation_id = data.replace('cancel_', '')
-        await handle_cancel_number(query, user_id, activation_id)
+    if nav_buttons:
+        keyboard.append(nav_buttons)
     
-    # عرض الرصيد
-    elif data == 'check_balance':
-        await handle_check_balance(query)
+    keyboard.append([InlineKeyboardButton("🔍 بحث عن دولة", callback_query_data="search_country")])
+    keyboard.append([InlineKeyboardButton("🏠 العودة للرئيسية", callback_query_data="back_home")])
     
-    # العودة للقائمة الرئيسية
-    elif data == 'back_to_menu':
-        await show_main_menu(query)
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text("الرجاء اختيار الدولة من القائمة أدناه:", reply_markup=reply_markup)
 
+async def list_services(update: Update, context: ContextTypes.DEFAULT_TYPE, country_id, page=0):
+    query = update.callback_query
+    services = await get_services()
+    
+    per_page = 10
+    start_idx = page * per_page
+    end_idx = start_idx + per_page
+    current_services = services[start_idx:end_idx]
+    
+    keyboard = []
+    for service in current_services:
+        s_name = service.get("name", "Unknown")
+        s_id = service.get("id")
+        keyboard.append([InlineKeyboardButton(f"📲 {s_name}", callback_query_data=f"buy:{country_id}:{s_id}")])
+    
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(InlineKeyboardButton("⬅️ السابق", callback_query_data=f"page_service:{country_id}:{page-1}"))
+    if end_idx < len(services):
+        nav_buttons.append(InlineKeyboardButton("التالي ➡️", callback_query_data=f"page_service:{country_id}:{page+1}"))
+    
+    if nav_buttons:
+        keyboard.append(nav_buttons)
+        
+    keyboard.append([InlineKeyboardButton("🔍 بحث عن خدمة", callback_query_data=f"search_service:{country_id}")])
+    keyboard.append([InlineKeyboardButton("🌍 تغيير الدولة", callback_query_data="list_countries")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(f"اختر الخدمة المطلوبة للدولة المختارة:", reply_markup=reply_markup)
 
-async def handle_country_selection(query, user_id: int, country_key: str) -> None:
-    """معالجة اختيار الدولة وحجز الرقم"""
-    country = GULF_COUNTRIES.get(country_key)
-    if not country:
-        await query.edit_message_text("❌ خطأ: دولة غير صحيحة")
-        return
+async def buy_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    _, country_id, service_id = query.data.split(":")
     
-    await query.edit_message_text(
-        f"⏳ جاري البحث عن رقم من {country['name']}...\n"
-        "الرجاء الانتظار..."
-    )
-    
-    # حجز الرقم
-    result = sms_api.get_number(country['id'])
-    
-    if not result['success']:
-        error_msg = (
-            f"❌ فشل الحصول على رقم من {country['name']}\n\n"
-            f"السبب: {result['error']}\n\n"
-            "يرجى المحاولة مرة أخرى أو اختيار دولة أخرى."
-        )
-        keyboard = [[InlineKeyboardButton("🔙 العودة للقائمة", callback_data='back_to_menu')]]
-        await query.edit_message_text(error_msg, reply_markup=InlineKeyboardMarkup(keyboard))
-        return
-    
-    # حفظ بيانات المستخدم
-    activation_id = result['activation_id']
-    phone_number = result['phone_number']
-    
-    user_data[user_id] = {
-        'activation_id': activation_id,
-        'phone_number': phone_number,
-        'country': country['name']
+    params = {
+        "action": "getNumber",
+        "api_key": SMS_API_KEY,
+        "country": country_id,
+        "service": service_id
     }
     
-    # عرض معلومات الرقم
-    success_msg = (
-        f"✅ تم حجز رقم من {country['name']}\n\n"
-        f"📱 الرقم: `+{phone_number}`\n"
-        f"🆔 معرف العملية: `{activation_id}`\n\n"
-        f"⏰ انتظر وصول كود الواتساب (حتى 20 دقيقة)\n"
-        f"ثم اضغط على زر التحديث للحصول على الكود"
-    )
-    
-    keyboard = [
-        [InlineKeyboardButton("🔄 تحديث - جلب الكود", callback_data=f'refresh_{activation_id}')],
-        [InlineKeyboardButton("❌ إلغاء الرقم", callback_data=f'cancel_{activation_id}')],
-        [InlineKeyboardButton("🔙 العودة للقائمة", callback_data='back_to_menu')],
-    ]
-    
-    await query.edit_message_text(
-        success_msg,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode='Markdown'
-    )
+    try:
+        response = requests.get(API_BASE_URL, params=params)
+        res_text = response.text
+        
+        if "ACCESS_NUMBER" in res_text:
+            # ACCESS_NUMBER:id:number
+            _, activation_id, number = res_text.split(":")
+            msg = (
+                f"✅ تم حجز الرقم بنجاح!\n\n"
+                f"📞 الرقم: `{number}`\n"
+                f"🆔 معرف العملية: `{activation_id}`\n\n"
+                "الرجاء طلب الكود في التطبيق ثم الضغط على زر التحديث."
+            )
+            keyboard = [
+                [InlineKeyboardButton("🔄 جلب الكود", callback_query_data=f"get_code:{activation_id}")],
+                [InlineKeyboardButton("❌ إلغاء الرقم", callback_query_data=f"cancel:{activation_id}")]
+            ]
+            await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        elif "NO_NUMBERS" in res_text:
+            await query.answer("❌ عذراً، لا تتوفر أرقام حالياً لهذه الخدمة في هذه الدولة.", show_alert=True)
+        elif "NO_BALANCE" in res_text:
+            await query.answer("❌ رصيدك غير كافٍ لإتمام العملية.", show_alert=True)
+        else:
+            await query.answer(f"❌ حدث خطأ: {res_text}", show_alert=True)
+            
+    except Exception as e:
+        logger.error(f"Error buying number: {e}")
+        await query.answer("❌ حدث خطأ تقني أثناء طلب الرقم.", show_alert=True)
 
+async def get_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    activation_id = query.data.split(":")[1]
+    
+    params = {"action": "getStatus", "api_key": SMS_API_KEY, "id": activation_id}
+    
+    try:
+        response = requests.get(API_BASE_URL, params=params)
+        res_text = response.text
+        
+        if "STATUS_OK" in res_text:
+            code = res_text.split(":")[1]
+            await query.edit_message_text(f"✅ الكود الواصل: `{code}`", parse_mode="Markdown")
+        elif "STATUS_WAIT_CODE" in res_text:
+            await query.answer("⏳ لم يصل الكود بعد، يرجى الانتظار والمحاولة مرة أخرى.", show_alert=True)
+        elif "STATUS_CANCEL" in res_text:
+            await query.edit_message_text("❌ تم إلغاء هذه العملية.")
+        else:
+            await query.answer(f"ℹ️ الحالة الحالية: {res_text}", show_alert=True)
+    except Exception as e:
+        logger.error(f"Error getting status: {e}")
+        await query.answer("❌ خطأ في جلب الحالة.", show_alert=True)
 
-async def handle_refresh_code(query, user_id: int, activation_id: str) -> None:
-    """معالجة طلب تحديث الكود"""
-    await query.answer("⏳ جاري البحث عن الكود...")
+async def cancel_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    activation_id = query.data.split(":")[1]
     
-    # الحصول على حالة الرقم
-    status_result = sms_api.get_status(activation_id)
+    params = {
+        "action": "setStatus",
+        "api_key": SMS_API_KEY,
+        "id": activation_id,
+        "status": "-1"
+    }
     
-    if not status_result['success']:
-        await query.answer(f"❌ خطأ: {status_result['error']}", show_alert=True)
+    try:
+        response = requests.get(API_BASE_URL, params=params)
+        if "ACCESS_CANCEL" in response.text:
+            await query.edit_message_text("✅ تم إلغاء الرقم بنجاح واستعادة الرصيد.")
+        else:
+            await query.answer(f"❌ لا يمكن الإلغاء حالياً: {response.text}", show_alert=True)
+    except Exception as e:
+        logger.error(f"Error cancelling: {e}")
+        await query.answer("❌ خطأ في عملية الإلغاء.", show_alert=True)
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+    
+    if data == "list_countries":
+        await list_countries(update, context)
+    elif data.startswith("page_country:"):
+        page = int(data.split(":")[1])
+        await list_countries(update, context, page=page)
+    elif data.startswith("select_country:"):
+        country_id = data.split(":")[1]
+        await list_services(update, context, country_id)
+    elif data.startswith("page_service:"):
+        _, country_id, page = data.split(":")
+        await list_services(update, context, country_id, page=int(page))
+    elif data.startswith("buy:"):
+        await buy_number(update, context)
+    elif data.startswith("get_code:"):
+        await get_code(update, context)
+    elif data.startswith("cancel:"):
+        await cancel_number(update, context)
+    elif data == "update_balance":
+        balance = await get_balance()
+        await query.answer(f"💰 رصيدك الحالي: {balance} USD", show_alert=True)
+    elif data == "back_home":
+        await start(update, context)
+    elif data == "search_country":
+        context.user_data["state"] = "search_country"
+        await query.edit_message_text("الرجاء إرسال اسم الدولة بالإنجليزية للبحث عنها:")
+    elif data.startswith("search_service:"):
+        country_id = data.split(":")[1]
+        context.user_data["state"] = "search_service"
+        context.user_data["search_country_id"] = country_id
+        await query.edit_message_text("الرجاء إرسال اسم الخدمة للبحث عنها (مثال: whatsapp):")
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state = context.user_data.get("state")
+    text = update.message.text.lower()
+    
+    if state == "search_country":
+        countries = await get_countries()
+        results = [c for c in countries if text in c.get("name_en", "").lower() or text in c.get("name", "").lower()]
+        
+        if not results:
+            await update.message.reply_text("❌ لم يتم العثور على نتائج. حاول مرة أخرى أو ارجع للرئيسية /start")
+            return
+            
+        keyboard = []
+        for c in results[:10]: # عرض أول 10 نتائج
+            keyboard.append([InlineKeyboardButton(f"🏳️ {c['name']}", callback_query_data=f"select_country:{c['id']}")])
+        
+        keyboard.append([InlineKeyboardButton("🏠 العودة للرئيسية", callback_query_data="back_home")])
+        await update.message.reply_text(f"🔍 نتائج البحث عن '{text}':", reply_markup=InlineKeyboardMarkup(keyboard))
+        context.user_data["state"] = None
+        
+    elif state == "search_service":
+        country_id = context.user_data.get("search_country_id")
+        services = await get_services()
+        results = [s for s in services if text in s.get("name", "").lower() or text in s.get("id", "").lower()]
+        
+        if not results:
+            await update.message.reply_text("❌ لم يتم العثور على خدمات تطابق بحثك.")
+            return
+            
+        keyboard = []
+        for s in results[:10]:
+            keyboard.append([InlineKeyboardButton(f"📲 {s['name']}", callback_query_data=f"buy:{country_id}:{s['id']}")])
+            
+        keyboard.append([InlineKeyboardButton("🌍 تغيير الدولة", callback_query_data="list_countries")])
+        await update.message.reply_text(f"🔍 نتائج البحث عن '{text}':", reply_markup=InlineKeyboardMarkup(keyboard))
+        context.user_data["state"] = None
+
+def main():
+    if not BOT_TOKEN or not SMS_API_KEY:
+        print("Error: BOT_TOKEN or SMS_API_KEY not set in environment variables.")
         return
-    
-    if status_result['status'] == 'received':
-        code = status_result['code']
-        
-        # تحديث حالة التفعيل (تم الاستلام)
-        sms_api.set_status(activation_id, 1)
-        
-        user_info = user_data.get(user_id, {})
-        success_msg = (
-            f"🎉 تم استلام الكود بنجاح!\n\n"
-            f"📱 الرقم: `+{user_info.get('phone_number', 'غير معروف')}`\n"
-            f"🔐 كود التفعيل: `{code}`\n\n"
-            f"استخدم الكود لتفعيل الواتساب الآن"
-        )
-        
-        keyboard = [[InlineKeyboardButton("🔙 العودة للقائمة", callback_data='back_to_menu')]]
-        
-        await query.edit_message_text(
-            success_msg,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='Markdown'
-        )
-    
-    elif status_result['status'] == 'waiting':
-        await query.answer(
-            "⏰ لم يصل الكود بعد، يرجى الانتظار والمحاولة مرة أخرى",
-            show_alert=True
-        )
-    
-    elif status_result['status'] == 'cancelled':
-        await query.answer("❌ تم إلغاء هذا الرقم", show_alert=True)
-        await show_main_menu(query)
 
-
-async def handle_cancel_number(query, user_id: int, activation_id: str) -> None:
-    """معالجة إلغاء الرقم"""
-    await query.answer("⏳ جاري إلغاء الرقم...")
-    
-    # إلغاء التفعيل (استرجاع الرصيد)
-    success = sms_api.set_status(activation_id, 8)
-    
-    if success:
-        # حذف بيانات المستخدم
-        if user_id in user_data:
-            del user_data[user_id]
-        
-        cancel_msg = (
-            "✅ تم إلغاء الرقم بنجاح\n"
-            "💰 تم استرجاع الرصيد\n\n"
-            "يمكنك طلب رقم جديد الآن"
-        )
-        
-        await query.answer("✅ تم الإلغاء بنجاح", show_alert=True)
-        await show_main_menu(query, cancel_msg)
-    else:
-        await query.answer("❌ فشل إلغاء الرقم، حاول مرة أخرى", show_alert=True)
-
-
-async def handle_check_balance(query) -> None:
-    """عرض الرصيد الحالي"""
-    balance = sms_api.get_balance()
-    
-    balance_msg = (
-        f"💰 الرصيد الحالي: {balance:.2f} روبل\n\n"
-        f"يمكنك شحن الرصيد من موقع SMS-Activate.org"
-    )
-    
-    keyboard = [[InlineKeyboardButton("🔙 العودة للقائمة", callback_data='back_to_menu')]]
-    
-    await query.edit_message_text(
-        balance_msg,
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-async def show_main_menu(query, message: str = None) -> None:
-    """عرض القائمة الرئيسية"""
-    keyboard = [
-        [
-            InlineKeyboardButton(GULF_COUNTRIES['saudi']['name'], callback_data='country_saudi'),
-            InlineKeyboardButton(GULF_COUNTRIES['uae']['name'], callback_data='country_uae'),
-        ],
-        [
-            InlineKeyboardButton(GULF_COUNTRIES['kuwait']['name'], callback_data='country_kuwait'),
-            InlineKeyboardButton(GULF_COUNTRIES['qatar']['name'], callback_data='country_qatar'),
-        ],
-        [
-            InlineKeyboardButton("💰 عرض الرصيد", callback_data='check_balance'),
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    text = message if message else "اختر الدولة التي تريد الحصول على رقم منها:"
-    
-    await query.edit_message_text(text, reply_markup=reply_markup)
-
-
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """معالج الأخطاء العام"""
-    logger.error(f"حدث خطأ: {context.error}")
-    
-    if update and update.effective_message:
-        await update.effective_message.reply_text(
-            "❌ حدث خطأ غير متوقع\n"
-            "يرجى المحاولة مرة أخرى أو التواصل مع المطور"
-        )
-
-
-def main() -> None:
-    """نقطة البداية الرئيسية للبوت"""
-    logger.info("🚀 بدء تشغيل البوت...")
-    
-    # إنشاء التطبيق
     application = Application.builder().token(BOT_TOKEN).build()
-    
-    # إضافة المعالجات
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CallbackQueryHandler(button_callback))
-    
-    # معالج الأخطاء
-    application.add_error_handler(error_handler)
-    
-    # بدء البوت
-    logger.info("✅ البوت يعمل الآن...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(handle_callback))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-if __name__ == '__main__':
+    print("Bot is starting...")
+    application.run_polling()
+
+if __name__ == "__main__":
     main()
